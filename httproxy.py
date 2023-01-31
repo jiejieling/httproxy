@@ -1,504 +1,1 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-# Copyright(C) 2001 - 2012 SUZUKI Hisao, Mitko Haralanov, Łukasz Langa
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files(the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
-
-"""Tiny HTTP Proxy.
-
-This module implements GET, HEAD, POST, PUT, DELETE and CONNECT
-methods on BaseHTTPServer.
-
-Usage:
-  httproxy [options]
-  httproxy [options] <allowed-client> ...
-
-Options:
-  -h, --help                   Show this screen.
-  --version                    Show version and exit.
-  -H, --host HOST              Host to bind to [default: 127.0.0.1].
-  -p, --port PORT              Port to bind to [default: 8000].
-  -l, --logfile PATH           Path to the logfile [default: STDOUT].
-  -i, --pidfile PIDFILE        Path to the pidfile [default: httproxy.pid].
-  -d, --daemon                 Daemonize (run in the background). The
-                               default logfile path is httproxy.log in
-                               this case.
-  -c, --configfile CONFIGFILE  Path to a configuration file.
-  -v, --verbose                Log headers.
-"""
-
-__version__ = "0.10.0"
-
-import atexit
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import errno
-import ftplib
-import logging
-import logging.handlers
-import os
-import re
-import select
-import signal
-import socket
-import socketserver
-import sys
-import threading
-from time import sleep
-from types import FrameType, CodeType
-import urllib.parse
-
-from configparser import ConfigParser
-from docopt import docopt
-
-DEFAULT_LOG_FILENAME = "httproxy.log"
-HEADER_TERMINATOR = re.compile(r'\r\n\r\n')
-
-
-class ProxyHandler(BaseHTTPRequestHandler):
-    server_version = "TinyHTTPProxy/" + __version__
-    protocol = "HTTP/1.0"
-    rbufsize = 0  # self.rfile Be unbuffered
-    allowed_clients = ()
-    verbose = False
-    cache = False
-
-    def handle(self):
-        ip, port = self.client_address
-        self.server.logger.log(logging.DEBUG, "Request from '%s'", ip)
-        if self.allowed_clients and ip not in self.allowed_clients:
-            self.raw_requestline = self.rfile.readline()
-            if self.parse_request():
-                self.send_error(403)
-        else:
-            BaseHTTPRequestHandler.handle(self)
-
-    def _connect_to(self, netloc, soc):
-        i = netloc.find(':')
-        if i >= 0:
-            host_port = netloc[:i], int(netloc[i + 1:])
-        else:
-            host_port = netloc, 80
-        self.server.logger.log(
-            logging.DEBUG, "Connect to %s:%d", host_port[0], host_port[1])
-        try:
-            soc.connect(host_port)
-            soc.setblocking(True)
-        except socket.error as arg:
-            try:
-                msg = arg[1]
-            except Exception:
-                msg = arg
-            self.send_error(500, msg)
-            return 0
-        return 1
-
-    def do_CONNECT(self):
-        soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            if self._connect_to(self.path, soc):
-                self.log_request(200)
-                self.wfile.write((self.protocol_version +
-                                 " 200 Connection established\r\n").encode())
-                self.wfile.write(("Proxy-agent: %s\r\n" % self.version_string()).encode())
-                self.wfile.write("\r\n".encode())
-                self._read_write(soc, 300)
-        finally:
-            soc.close()
-            self.connection.close()
-
-    def do_GET(self):
-        scm, netloc, path, params, query, fragment = urllib.parse.urlparse(
-            self.path, 'http')
-        if scm not in ('http', 'ftp') or fragment or not netloc:
-            self.send_error(400, "bad URL %s" % self.path)
-            return
-        soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            if scm == 'http':
-                if self._connect_to(netloc, soc):
-                    self.log_request()
-                    rq = []
-                    rq.append("%s %s %s\r\n" % (
-                        self.command, urllib.parse.urlunparse(
-                            ('', '', path, params, query, '')),
-                        self.request_version,
-                    ))
-                    self.headers['Connection'] = 'close'
-                    del self.headers['Proxy-Connection']
-                    for key_val in list(self.headers.items()):
-                        self.log_verbose("%s: %s", *key_val)
-                        rq.append("%s: %s\r\n" % key_val)
-                    rq.append("\r\n")
-                    soc.send(''.join(rq).encode())
-                    self._read_write(soc)
-            elif scm == 'ftp':
-                # fish out user and password information
-                i = netloc.find('@')
-                if i >= 0:
-                    login_info, netloc = netloc[:i], netloc[i + 1:]
-                    try:
-                        user, passwd = login_info.split(':', 1)
-                    except ValueError:
-                        user, passwd = "anonymous", None
-                else:
-                    user, passwd = "anonymous", None
-                self.log_request()
-                try:
-                    ftp = ftplib.FTP(netloc)
-                    ftp.login(user, passwd)
-                    if self.command == "GET":
-                        ftp.retrbinary("RETR %s" % path, self.connection.send)
-                    ftp.quit()
-                except Exception as e:
-                    self.server.logger.log(
-                        logging.WARNING, "FTP Exception: %s", e
-                    )
-        finally:
-            soc.close()
-            self.connection.close()
-
-    def handle_one_request(self):
-        try:
-            BaseHTTPRequestHandler.handle_one_request(self)
-        except socket.error as e:
-            if e.errno == errno.ECONNRESET:
-                pass  # ignore the error
-            else:
-                raise
-
-    def _read_write(self, soc, max_idling=20):
-        conn = {}
-        epoll = select.epoll()
-        for i in [self.connection, soc]:
-            epoll.register(i.fileno(), select.EPOLLIN | select.EPOLLET)
-            conn[i.fileno()] = i
-
-        local_data = []
-        count = 0
-        soc_fd = soc.fileno()
-        while True:
-            count += 1
-            events = epoll.poll(1)
-            for fileno, event in events:
-                if event & select.EPOLLIN:
-                    data = conn[fileno].recv(8192)
-
-                    if fileno == soc_fd:
-                        out = self.connection
-                    else:
-                        out = soc
-
-                    if data:
-                        if self.cache or self.verbose:
-                            local_data.append(data)
-                        try:
-                            out.send(data)
-                        except:
-                            if out == soc:
-                                self.log_error('Send data to server error')
-                                self.send_error(500, 'Upstream has gone away')
-                            else:
-                                self.log_error('Send data to client error')
-                            conn = {}
-                            break
-
-                        count = 0
-                    else:
-                        if fileno == soc_fd:
-                            self.log_message('Get close event from server')
-                            self.send_error(500, 'Upstream has gone away')
-                        else:
-                            self.log_message('Get close event from client')
-                        conn = {}
-                        break
-
-            if count == max_idling or not conn:
-                break
-
-        result = "".join(local_data)
-        if self.verbose:
-            ht = HEADER_TERMINATOR.search(result)
-            if ht:
-                headers = result[:ht.span()[0]].split('\n')
-                for header in headers:
-                    header = header.strip()
-                    self.log_verbose("[response] %s", header)
-        return result
-
-    do_HEAD = do_GET
-    do_POST = do_GET
-    do_PUT = do_GET
-    do_DELETE = do_GET
-
-    def log_verbose(self, fmt, *args):
-        if not self.verbose:
-            return
-        self.server.logger.log(
-            logging.DEBUG, "%s %s", self.address_string(), fmt % args
-        )
-
-    def log_message(self, fmt, *args):
-        self.server.logger.log(
-            logging.INFO, "%s %s", self.address_string(), fmt % args
-        )
-
-    def log_error(self, fmt, *args):
-        self.server.logger.log(
-            logging.ERROR, "%s %s", self.address_string(), fmt % args
-        )
-
-
-class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    def __init__(self, server_address, RequestHandlerClass, logger=None):
-        HTTPServer.__init__(self, server_address, RequestHandlerClass)
-        self.logger = logger
-
-
-def setup_logging(filename, log_size, daemon, verbose):
-    logger = logging.getLogger("TinyHTTPProxy")
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-    if not filename or filename in ('-', 'STDOUT'):
-        if not daemon:
-            # display to the screen
-            handler = logging.StreamHandler()
-        else:
-            handler = logging.handlers.RotatingFileHandler(
-                DEFAULT_LOG_FILENAME, maxBytes=(log_size * (1 << 20)),
-                backupCount=5
-            )
-    else:
-        handler = logging.handlers.RotatingFileHandler(
-            filename, maxBytes=(log_size * (1 << 20)), backupCount=5)
-    fmt = logging.Formatter("[%(asctime)-12s.%(msecs)03d] "
-                            "%(levelname)-8s %(threadName)s  "
-                            "%(message)s",
-                            "%Y-%m-%d %H:%M:%S")
-    handler.setFormatter(fmt)
-
-    logger.addHandler(handler)
-    return logger
-
-
-def daemonize(logger):
-    class DevNull(object):
-        def __init__(self):
-            self.fd = os.open(os.devnull, os.O_WRONLY)
-
-        def write(self, *args, **kwargs):
-            return 0
-
-        def read(self, *args, **kwargs):
-            return 0
-
-        def fileno(self):
-            return self.fd
-
-        def close(self):
-            os.close(self.fd)
-
-    class ErrorLog(object):
-        def __init__(self, obj):
-            self.obj = obj
-
-        def write(self, string):
-            self.obj.log(logging.ERROR, string)
-
-        def read(self, *args, **kwargs):
-            return 0
-
-        def close(self):
-            pass
-
-    if os.fork() != 0:
-        # allow the child pid to instantiate the server class
-        sleep(1)
-        sys.exit(0)
-    os.setsid()
-    fd = os.open(os.devnull, os.O_RDONLY)
-    if fd != 0:
-        os.dup2(fd, 0)
-        os.close(fd)
-    null = DevNull()
-    log = ErrorLog(logger)
-    sys.stdout = null
-    sys.stderr = log
-    sys.stdin = null
-    fd = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(sys.stdout.fileno(), 1)
-    if fd != 2:
-        os.dup2(fd, 2)
-    if fd not in (1, 2):
-        os.close(fd)
-
-
-def set_process_title(args):
-    try:
-        import setproctitle
-    except ImportError:
-        return
-    proc_details = ['httproxy']
-    for arg, value in sorted(args.items()):
-        if value is True:
-            proc_details.append(arg)
-        elif value in (False, None):
-            pass  # don't include false or empty toggles
-        elif arg == '<allowed-client>':
-            for client in value:
-                proc_details.append(client)
-        else:
-            value = str(value)
-            if 'file' in arg and value not in ('STDOUT', '-'):
-                value = os.path.realpath(value)
-            proc_details.append(arg)
-            proc_details.append(value)
-    setproctitle.setproctitle(" ".join(proc_details))
-
-
-def handle_pidfile(pidfile, logger):
-    pid = str(os.getpid())
-    try:
-        with open(pidfile) as pf:
-            stale_pid = pf.read()
-        if pid != stale_pid:
-            try:
-                import psutil
-                if psutil.pid_exists(int(stale_pid)):
-                    msg = ("Pidfile `%s` exists. PID %s still running. "
-                           "Exiting." % (pidfile, stale_pid))
-                    logger.log(logging.CRITICAL, msg)
-                    raise RuntimeError(msg)
-                msg = ("Removed stale pidfile `%s` with non-existing PID %s."
-                       % (pidfile, stale_pid))
-                logger.log(logging.WARNING, msg)
-            except (ImportError, ValueError):
-                msg = "Pidfile `%s` exists. Exiting." % pidfile
-                logger.log(logging.CRITICAL, msg)
-                raise RuntimeError(msg)
-    except IOError:
-        with open(pidfile, 'w') as pf:
-            pf.write(pid)
-    atexit.register(os.unlink, pidfile)
-
-
-def handle_configuration():
-    default_args = docopt(__doc__, argv=(), version=__version__)
-    cmdline_args = docopt(__doc__, version=__version__)
-    for a in default_args:
-        if cmdline_args[a] == default_args[a]:
-            del cmdline_args[a]  # only keep overriden values
-    del default_args['<allowed-client>']
-    inifile = ConfigParser(allow_no_value=True)
-    inifile.optionxform = lambda o: o if o.startswith('--') else ('--' + o)
-    inifile['DEFAULT'] = default_args
-    inifile['allowed-clients'] = {}
-    read_from = inifile.read([
-        'config.conf',
-        os.sep + os.sep.join(('etc', 'httproxy', 'config')),
-        os.path.expanduser(os.sep.join(('~', '.httproxy', 'config'))),
-        cmdline_args.get('--configfile') or '',
-    ])
-    iniconf = dict(inifile['main'])
-    for opt in iniconf:
-        try:
-            iniconf[opt] = inifile['main'].getboolean(opt)
-            continue
-        except (ValueError, AttributeError):
-            pass  # not a boolean
-        try:
-            iniconf[opt] = inifile['main'].getint(opt)
-            continue
-        except (ValueError, TypeError):
-            pass  # not an int
-    iniconf.update(cmdline_args)
-    if not iniconf.get('<allowed-client>'):
-        # copy values from INI but don't include --port etc.
-        inifile['DEFAULT'].clear()
-        clients = []
-        for client in inifile['allowed-clients']:
-            clients.append(client[2:])
-        iniconf['<allowed-client>'] = clients
-    return read_from, iniconf
-
-
-def main():
-    max_log_size = 20
-    run_event = threading.Event()
-    read_from, args = handle_configuration()
-    logger = setup_logging(
-        args['--logfile'], max_log_size, args['--daemon'], args['--verbose'],
-    )
-    for path in read_from:
-        logger.log(logging.DEBUG, 'Read configuration from `%s`.' % path)
-    try:
-        args['--port'] = int(args['--port'])
-        if not (0 < args['--port'] < 65536):
-            raise ValueError("Out of range.")
-    except (ValueError, TypeError):
-        msg = "`%s` is not a valid port number. Exiting." % args['--port']
-        logger.log(logging.CRITICAL, msg)
-        return 1
-    if args['--daemon']:
-        daemonize(logger)
-
-    if args['<allowed-client>']:
-        allowed = []
-        for name in args['<allowed-client>']:
-            try:
-                client = socket.gethostbyname(name)
-            except socket.error as e:
-                logger.log(logging.CRITICAL, "%s: %s. Exiting." % (name, e))
-                return 3
-            allowed.append(client)
-            logger.log(logging.INFO, "Accept: %s(%s)" % (client, name))
-        ProxyHandler.allowed_clients = allowed
-    else:
-        logger.log(logging.INFO, "Any clients will be served...")
-    ProxyHandler.verbose = args['--verbose']
-    set_process_title(args)
-    server_address = socket.gethostbyname(args['--host']), args['--port']
-    httpd = ThreadingHTTPServer(server_address, ProxyHandler, logger)
-    sa = httpd.socket.getsockname()
-    logger.info("Serving HTTP on %s:%s" % (sa[0], sa[1]))
-    atexit.register(logger.log, logging.INFO, "Server shutdown")
-    req_count = 0
-    while True:
-        try:
-            httpd.handle_request()
-            req_count += 1
-            if req_count == 1000:
-                logger.log(
-                    logging.INFO, "Number of active threads: %s",
-                    threading.activeCount()
-                )
-                req_count = 0
-        except select.error as e:
-            if e[0] == 4:
-                pass
-            else:
-                logger.log(logging.CRITICAL, "Errno: %d - %s", e[0], e[1])
-        except KeyboardInterrupt:
-            logger.log(logging.INFO, 'Recive exit signal, process exited')
-            break
-
-    return 0
-
-
-if __name__ == '__main__':
-    sys.exit(main())
+#!/usr/bin/env python3# -*- coding: utf-8 -*-# Copyright(C) 2001 - 2023 SUZUKI Hisao, Mitko Haralanov, Łukasz Langa, Seven Ling# Permission is hereby granted, free of charge, to any person obtaining a copy# of this software and associated documentation files(the "Software"), to deal# in the Software without restriction, including without limitation the rights# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell# copies of the Software, and to permit persons to whom the Software is# furnished to do so, subject to the following conditions:# The above copyright notice and this permission notice shall be included in# all copies or substantial portions of the Software.# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN# THE SOFTWARE.__version__ = "1.0"import atexitfrom http.server import BaseHTTPRequestHandler, HTTPServerimport errnoimport ftplibimport loggingimport logging.handlersimport osimport reimport selectimport signalimport socketimport socketserverimport sysimport threadingfrom time import sleepimport urllib.parseimport argparseDEFAULT_LOG_FILENAME = "httproxy.log"HEADER_TERMINATOR = re.compile(r'\r\n\r\n')class ProxyHandler(BaseHTTPRequestHandler):    server_version = "TinyHTTPProxy/" + __version__    protocol = "HTTP/1.0"    rbufsize = 0  # self.rfile Be unbuffered    allowed_clients = ()    cache = False    def handle(self):        ip, port = self.client_address        self.server.logger.log(logging.DEBUG, "Request from '%s'", ip)        if self.allowed_clients and ip not in self.allowed_clients:            self.raw_requestline = self.rfile.readline()            if self.parse_request():                self.send_error(403)        else:            BaseHTTPRequestHandler.handle(self)    def _connect_to(self, netloc, soc):        i = netloc.find(':')        if i >= 0:            host_port = netloc[:i], int(netloc[i + 1:])        else:            host_port = netloc, 80        self.server.logger.log(            logging.DEBUG, "Connect to %s:%d", host_port[0], host_port[1])        try:            soc.connect(host_port)        except socket.error as arg:            self.send_error(500, f'Connect to {netloc} error')            return False        return True    def do_CONNECT(self):        self.server.logger.debug(f'Handle request to url[{self.path}]')        soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)        try:            if self._connect_to(self.path, soc):                self.log_request(200)                self.wfile.write((self.protocol_version +                                  " 200 Connection established\r\n").encode())                self.wfile.write(("Proxy-agent: %s\r\n" % self.version_string()).encode())                self.wfile.write("\r\n".encode())                self._read_write(soc, 300)        finally:            soc.close()            self.connection.close()    def do_GET(self):        self.server.logger.debug(f'Handle request to url[{self.path}]')        scm, netloc, path, params, query, fragment = urllib.parse.urlparse(            self.path, 'http')        if scm not in ('http', 'ftp') or fragment or not netloc:            self.send_error(400, "bad URL %s" % self.path)            return        soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)        try:            if scm == 'http':                if self._connect_to(netloc, soc):                    self.log_request()                    rq = []                    rq.append("%s %s %s\r\n" % (                        self.command, urllib.parse.urlunparse(                            ('', '', path, params, query, '')),                        self.request_version,                    ))                    self.headers['Connection'] = 'close'                    del self.headers['Proxy-Connection']                    for key_val in list(self.headers.items()):                        self.log_verbose("%s: %s", *key_val)                        rq.append("%s: %s\r\n" % key_val)                    rq.append("\r\n")                    soc.send(''.join(rq).encode())                    self._read_write(soc, 300)            elif scm == 'ftp':                # fish out user and password information                i = netloc.find('@')                if i >= 0:                    login_info, netloc = netloc[:i], netloc[i + 1:]                    try:                        user, passwd = login_info.split(':', 1)                    except ValueError:                        user, passwd = "anonymous", None                else:                    user, passwd = "anonymous", None                self.log_request()                try:                    ftp = ftplib.FTP(netloc)                    ftp.login(user, passwd)                    if self.command == "GET":                        ftp.retrbinary("RETR %s" % path, self.connection.send)                    ftp.quit()                except Exception as e:                    self.server.logger.log(                        logging.WARNING, "FTP Exception: %s", e                    )        finally:            soc.close()            self.connection.close()    def handle_one_request(self):        try:            BaseHTTPRequestHandler.handle_one_request(self)        except socket.error as e:            if e.errno == errno.ECONNRESET:                pass  # ignore the error            else:                raise    def _read_write(self, soc, max_idling=20):        conn = {}        epoll = select.epoll()        for i in [self.connection, soc]:            epoll.register(i.fileno(), select.EPOLLIN)            conn[i.fileno()] = i        count = 0        while True:            count += 1            events = epoll.poll(0.1)            for fileno, event in events:                if event & select.EPOLLIN:                    data = conn[fileno].recv(4096)                    if fileno == soc.fileno():                        out = self.connection                    else:                        out = soc                    if data:                        try:                            out.sendall(data)                        except:                            if out == soc:                                # Send to server error                                self.log_error('Send data to server error')                                self.send_error(500, 'Upstream has gone away')                            else:                                # Send to client error                                self.log_error('Send data to client error')                            epoll.unregister(fileno)                            conn[fileno].close()                            del conn[out.fileno()]                        count = 0                    else:                        self.server.logger.debug('Recv close event')                        epoll.unregister(fileno)                        conn[fileno].close()                        del conn[fileno]            if count == max_idling or len(conn) != 2:                break        epoll.close()        return True    do_OPTION = do_GET    do_HEAD = do_GET    do_POST = do_GET    do_PUT = do_GET    do_DELETE = do_GET    def log_verbose(self, fmt, *args):        self.server.logger.log(            logging.DEBUG, "%s %s", self.address_string(), fmt % args        )    def log_message(self, fmt, *args):        self.server.logger.log(            logging.INFO, "%s %s", self.address_string(), fmt % args        )    def log_error(self, fmt, *args):        self.server.logger.log(            logging.ERROR, "%s %s", self.address_string(), fmt % args        )class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):    def __init__(self, server_address, RequestHandlerClass, logger=None):        HTTPServer.__init__(self, server_address, RequestHandlerClass)        self.logger = loggerdef setup_logging(filename, log_size, daemon, verbose):    logger = logging.getLogger("TinyHTTPProxy")    logger.setLevel(logging.DEBUG if verbose else logging.INFO)    if not filename or filename in ('-', 'STDOUT'):        if not daemon:            # display to the screen            handler = logging.StreamHandler()        else:            handler = logging.handlers.RotatingFileHandler(                DEFAULT_LOG_FILENAME, maxBytes=(log_size * (1 << 20)),                backupCount=5            )    else:        handler = logging.handlers.RotatingFileHandler(            filename, maxBytes=(log_size * (1 << 20)), backupCount=5)    fmt = logging.Formatter("[%(asctime)-12s.%(msecs)03d] "                            "%(levelname)-8s %(threadName)s  "                            "%(message)s",                            "%Y-%m-%d %H:%M:%S")    handler.setFormatter(fmt)    logger.addHandler(handler)    return loggerdef daemonize(logger):    class DevNull(object):        def __init__(self):            self.fd = os.open(os.devnull, os.O_WRONLY)        def write(self, *args, **kwargs):            return 0        def read(self, *args, **kwargs):            return 0        def fileno(self):            return self.fd        def close(self):            os.close(self.fd)    class ErrorLog(object):        def __init__(self, obj):            self.obj = obj        def write(self, string):            self.obj.log(logging.ERROR, string)        def read(self, *args, **kwargs):            return 0        def close(self):            pass    if os.fork() != 0:        # allow the child pid to instantiate the server class        sleep(1)        sys.exit(0)    os.setsid()    fd = os.open(os.devnull, os.O_RDONLY)    if fd != 0:        os.dup2(fd, 0)        os.close(fd)    null = DevNull()    log = ErrorLog(logger)    sys.stdout = null    sys.stderr = log    sys.stdin = null    fd = os.open(os.devnull, os.O_WRONLY)    os.dup2(sys.stdout.fileno(), 1)    if fd != 2:        os.dup2(fd, 2)    if fd not in (1, 2):        os.close(fd)def usage():    parser = argparse.ArgumentParser(description='Tiny HTTP Proxy')    parser.add_argument('-H', '--host', type=str, dest="host", default='127.0.0.1',                        help="Host to bind to [default: 127.0.0.1]")    parser.add_argument('-P', '--port', type=int, dest="port", default='8000',                        help="Port to bind to [default: 8000]")    parser.add_argument('-l', '--logfile', type=str, dest="logfile", default='STDOUT',                        help="Path to the logfile [default: STDOUT]")    parser.add_argument('-d', '--daemon', action='store_true', dest="daemon", default=False,                        help="Daemonize (run in the background). Daemon mode must specify logfile")    parser.add_argument('-v', '--verbose', action='store_true', dest="verbose", default=False,                        help="Log debug info")    args = parser.parse_args()    if args.daemon and args.logfile == 'STDOUT':        parser.print_help()        sys.exit(1)    return args.host, args.port, args.logfile, args.daemon, args.verbosedef main():    host, port, logfile, daemon, verbose = usage()    if not (0 < port < 65536):        print(f'Port[{port}] invalid')        return False    # Init logger    logger = setup_logging(logfile, 20, daemon, verbose)    # Setup daemon    if daemon:        daemonize(logger)    server_address = socket.gethostbyname(host), port    httpd = ThreadingHTTPServer(server_address, ProxyHandler, logger)    sa = httpd.socket.getsockname()    logger.info("Serving HTTP on %s:%s" % (sa[0], sa[1]))    req_count = 0    while True:        try:            httpd.handle_request()            req_count += 1            if req_count == 1000:                logger.log(                    logging.INFO, "Number of active threads: %s",                    threading.activeCount()                )                req_count = 0        except select.error as e:            if e[0] == 4:                pass            else:                logger.log(logging.CRITICAL, "Errno: %d - %s", e[0], e[1])        except KeyboardInterrupt:            logger.log(logging.INFO, 'Recive exit signal, process exit')            break    return 0if __name__ == '__main__':    sys.exit(main())
