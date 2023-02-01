@@ -120,4 +120,4 @@ Authors
 -------
 
 Script based on work by Suzuki Hisao and Mitko Haralanov, currently maintained
-by `Łukasz Langa <mailto:lukasz@langa.pl>`_.
+by `Seven Ling <mailto:jiejie.ling@qq.com>`_.
