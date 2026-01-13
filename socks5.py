@@ -230,7 +230,7 @@ def main():
         context = daemon.DaemonContext(
             working_directory='/tmp',
             umask=0o022,
-            pidfile=pidfile.TimeoutPIDLockFile(args.pidspec),
+            pidfile=pidfile.TimeoutPIDLockFile(args.pidfile),
             files_preserve=[handler.stream.fileno() for handler in logger.handlers],
             stdout=logger.handlers[0].stream,
             stderr=logger.handlers[0].stream,
